@@ -1,0 +1,9 @@
+[package]
+name = "mos6502"
+description = "A MOS 6502 Simple CPU Emulator"
+version = "0.1.0"
+authors = ["laudleon@gmail.com"]
+exclude = ["examples/**"]
+
+[lib]
+name = "mos6502"
