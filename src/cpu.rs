@@ -100,6 +100,9 @@ pub struct CPU {
     pub y: u8,
     sp: u8,
     pc: u16,
+    nmi_requested: bool,
+    reset_requested: bool,
+    irq_requested: bool,
 
     flags: CPUFlags,
 
@@ -110,9 +113,8 @@ pub struct CPU {
 }
 
 impl CPU {
-    pub fn new() -> Self {
+    pub fn new(mem: memory_map::MemoryMap) -> Self {
         let flags = CPUFlags::new();
-        let mem = memory_map::MemoryMap::new();
 
         CPU {
             a: 0,
@@ -122,24 +124,40 @@ impl CPU {
             pc: 0,
             flags,
             mem,
+            nmi_requested: false,
+            reset_requested: false,
+            irq_requested: false,
             jmp_bug: true,
             decimal_mode_enabled: false
         }
     }
 
-    pub fn reset(&mut self) {
-        self.pc = self.fetch_address_from_vector(memory_map::RESETVECADR);
-        self.a = 0;
-        self.x = 0;
-        self.y = 0;
-        self.sp = 0xFD;
-        // TODO: Implement!
-        // self.flags.reset();
-        // self.mem.reset();
+    pub fn request_reset(&mut self) {
+        self.reset_requested = true
     }
 
-    pub fn mount_in_bus(&mut self, mem_range: Range<usize>, device: impl memory_map::MemMappeable + 'static) {
-        self.mem.register_device(mem_range, device);
+    pub fn request_nmi(&mut self) {
+        self.nmi_requested = true
+    }
+
+    pub fn request_irq(&mut self) {
+        self.irq_requested = true
+    }
+
+    pub fn reset_requested(&self) -> bool {
+        self.reset_requested
+    }
+
+    pub fn nmi_requested(&self) -> bool {
+        self.nmi_requested
+    }
+
+    pub fn irq_requested(&self) -> bool {
+        self.irq_requested
+    }
+
+    pub fn show_memmap(&self) -> String {
+        format!("{:?}", self.mem)
     }
 
     pub fn exec(&mut self, from_address: Option<u16>) {
@@ -147,21 +165,34 @@ impl CPU {
             Some(address) => self.pc = address,
                      None => self.reset()
         }
-        loop { self.step() }
+        loop { self.step(); }
     }
 
-    pub fn step(&mut self) {
-      match self.mem.fetch_instruction(self.pc) {
-          Some(instruction) => {
-              println!("{:04x}: {:?} | {:?}", self.pc, instruction, self);
-              self.pc = self.pc.wrapping_add(instruction.bytesize() as u16);
-              instruction.exec(self);
-          },
-          None => {
-              println!("{:04x}: Unknown instruction fetched: {:02x}", self.pc, self.mem.read(self.pc));
-              self.pc += 1; // Acts as NOP
-          }
-      };
+    pub fn step(&mut self) -> String {
+        let status : String;
+
+        if self.reset_requested() {
+            self.reset();
+            self.reset_requested = false;
+        }
+        if self.nmi_requested() {
+            self.nmi();
+        } else if self.irq_requested() && !self.flags.has_set(Flag::IntDisabled) {
+            self.irq();
+        }
+
+        match self.mem.fetch_instruction(self.pc) {
+            Some(instruction) => {
+                status = format!("{:04x}: {:?} | {:?}", self.pc, instruction, self);
+                self.pc = self.pc.wrapping_add(instruction.bytesize() as u16);
+                instruction.exec(self);
+            },
+            None => {
+                status = format!("{:04x}: Unknown instruction fetched", self.pc);
+                self.pc += 1; // Acts as NOP
+            }
+        }
+        status
     }
 
     pub fn set_pc(&mut self, address: u16) {
@@ -247,14 +278,7 @@ impl CPU {
     }
 
     pub fn brk(&mut self, _am: &AddressingMode) {
-        // Push PC
-        self.push_st_16(self.pc);
-        // Push Flags
-        self.push_st_8(self.flags.to_byte());
-        // Set PC to Interruption Vector address
-        self.pc = self.fetch_address_from_vector(memory_map::INTVECADR);
-        // Set Flags
-        self.flags.set(Flag::IntDisabled, true);
+        self.save_ctx_and_loads(memory_map::INTVECADR);
         self.flags.set(Flag::Break, true);
     }
 
@@ -581,6 +605,36 @@ impl CPU {
 
     // Private methods
 
+    fn reset(&mut self) {
+        self.pc = self.fetch_address_from_vector(memory_map::RESETVECADR);
+        self.a = 0;
+        self.x = 0;
+        self.y = 0;
+        self.sp = 0xFD;
+        // TODO: Implement!
+        // self.flags.reset();
+        // self.mem.reset();
+    }
+
+    fn nmi(&mut self) {
+        self.save_ctx_and_loads(memory_map::NMIVECADR);
+    }
+
+    fn irq(&mut self) {
+        self.save_ctx_and_loads(memory_map::INTVECADR);
+    }
+
+    fn save_ctx_and_loads(&mut self, vector: u16) {
+        // Push PC
+        self.push_st_16(self.pc);
+        // Push Flags
+        self.push_st_8(self.flags.to_byte());
+        // Set PC to Interruption Vector address
+        self.pc = self.fetch_address_from_vector(vector);
+        // Disable further interruptions
+        self.flags.set(Flag::IntDisabled, true);
+    }
+
     fn compare(&mut self, am: &AddressingMode, reg: u8) {
         let m = self.read_op(am);
         let c = reg.wrapping_sub(m);
@@ -603,12 +657,18 @@ impl CPU {
         self.flags.set(Flag::Negative, (val & 0x80) == 0x80);
     }
 
+    fn read_mem(&self, address: u16) -> u8 {
+        self.mem.read(address).unwrap_or_else(|| {
+            panic!("Invalid read access from 0x{:04x}", address)
+        })
+    }
+
     fn read_op(&self, am: &AddressingMode) -> u8 {
         use self::AddressingMode::*;
 
         if am.has_to_access_memory() {
             let address = self.resolve_mem_address(am);
-            self.mem.read(address)
+            self.read_mem(address)
         } else {
             match *am {
                 AccA  => self.a,
@@ -717,23 +777,23 @@ impl CPU {
             },
             Indirect { l, h } => {
                 let ind_address = address8to16(l, h);
-                let lo = self.mem.read(ind_address);
-                let hi = self.mem.read(hi_byte_adr_from(ind_address, l, h));
+                let lo = self.read_mem(ind_address);
+                let hi = self.read_mem(hi_byte_adr_from(ind_address, l, h));
                 let address = address8to16(lo, hi);
                 address
             },
             IndirectIndexed { a } => {
                 let ind_address = address8to16(a, 0);
-                let lo = self.mem.read(ind_address);
-                let hi = self.mem.read(hi_byte_adr_from(ind_address, a, 0));
+                let lo = self.read_mem(ind_address);
+                let hi = self.read_mem(hi_byte_adr_from(ind_address, a, 0));
                 let address = address8to16(lo, hi).wrapping_add(address8to16(self.y, 0));
                 address
             },
             IndexedIndirect { a } => {
                 let lo_byte_adr = a.wrapping_add(self.x);
                 let ind_address = address8to16(lo_byte_adr, 0);
-                let lo = self.mem.read(ind_address);
-                let hi = self.mem.read(hi_byte_adr_from(ind_address, lo_byte_adr, 0));
+                let lo = self.read_mem(ind_address);
+                let hi = self.read_mem(hi_byte_adr_from(ind_address, lo_byte_adr, 0));
                 let address = address8to16(lo, hi);
                 address
             },
@@ -742,8 +802,8 @@ impl CPU {
     }
 
     fn fetch_address_from_vector(&self, vector: u16) -> u16 {
-        let lo = self.mem.read(vector);
-        let hi = self.mem.read(vector + 1);
+        let lo = self.read_mem(vector);
+        let hi = self.read_mem(vector + 1);
         ((hi as u16) << 8) | lo as u16
     }
 
